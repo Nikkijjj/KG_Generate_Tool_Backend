@@ -4,6 +4,7 @@ from routes.login_api import login_bp
 from routes.textPreprocess_api import textPreprocess_bp  # 导入 Blueprint
 from routes.projectManage_api import projectManage_bp
 from routes.dashboard_api import dashboard_bp
+from routes.extractSample_bp import extractSample_bp
 
 # 登录 项目管理啥的 没删掉 应该可以复用
 
@@ -16,6 +17,8 @@ app.register_blueprint(textPreprocess_bp, url_prefix='/api')
 app.register_blueprint(projectManage_bp)
 
 app.register_blueprint(dashboard_bp)
+
+app.register_blueprint(extractSample_bp)
 
 
 
