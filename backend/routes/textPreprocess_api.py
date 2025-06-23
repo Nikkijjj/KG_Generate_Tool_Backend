@@ -1,5 +1,4 @@
 import time
-
 from flask import Blueprint, jsonify, request
 from database import get_client
 from datetime import datetime
@@ -13,39 +12,45 @@ def get_data_from_db(page=1, page_size=12):
         client = get_client()
         offset = (page - 1) * page_size
 
-        # 1. 查询分页数据
-        query_data = f'''
-            SELECT id, title, content, stock_num, date
-            FROM cyydws.announce_data
-            LIMIT {page_size} OFFSET {offset}
-        '''
-        result_data = client.query(query_data)
+        with client.cursor() as cursor:
+            # 1. 查询分页数据 - 将参数直接拼接到SQL中
+            query_data = f'''
+                SELECT id, title, content, stock_num, date
+                FROM announce_data
+                LIMIT {page_size} OFFSET {offset}
+            '''
+            cursor.execute(query_data)
+            result_data = cursor.fetchall()
 
-        # 2. 查询总数据量（用于前端分页器）
-        query_total = 'SELECT COUNT(*) FROM cyydws.announce_data'
-        result_total = client.query(query_total)
-        total = result_total.result_rows[0][0] if result_total.result_rows else 0
+            # 2. 查询总数据量
+            query_total = 'SELECT COUNT(*) FROM announce_data'
+            cursor.execute(query_total)
+            total = cursor.fetchone()['COUNT(*)'] if cursor.rowcount else 0
 
-        # 格式化数据
-        data = [
-            {
-                "id": row[0],
-                "title": row[1],
-                "content": row[2],
-                "stock_num": row[3],
-                "date": row[4]
+            # 格式化数据
+            data = [
+                {
+                    "id": row['id'],
+                    "title": row['title'],
+                    "content": row['content'],
+                    "stock_num": row['stock_num'],
+                    "date": str(row['date']) if row['date'] else None
+                }
+                for row in result_data
+            ]
+
+            return {
+                "data": data,
+                "total": total
             }
-            for row in result_data.result_rows
-        ]
-
-        return {
-            "data": data,
-            "total": total  # 返回总数据量
-        }
 
     except Exception as e:
         print(f'Error fetching data from database: {e}')
         return {"data": [], "total": 0}
+    finally:
+        client.close()
+
+
 
 @textPreprocess_bp.route('/textPreprocess_api', methods=['POST'])
 def fetch_data():
@@ -92,33 +97,57 @@ def delete_selected_data():
 
         client = get_client()
 
-        # 方法1：创建临时表并重新插入需要保留的数据
-        temp_table = f"temp_{int(time.time())}"
+    #     # 方法1：创建临时表并重新插入需要保留的数据
+    #     temp_table = f"temp_{int(time.time())}"
+    #
+    #     # 1. 创建临时表
+    #     client.command(f"""
+    #         CREATE TABLE {temp_table} AS cyydws.announce_data
+    #         ENGINE = MergeTree()
+    #         ORDER BY id
+    #     """)
+    #
+    #     # 2. 插入需要保留的数据
+    #     id_list = ",".join([f"'{id}'" for id in ids])
+    #     client.command(f"""
+    #         INSERT INTO {temp_table}
+    #         SELECT * FROM cyydws.announce_data
+    #         WHERE id NOT IN ({id_list})
+    #     """)
+    #
+    #     # 3. 删除原表并重命名临时表
+    #     client.command("DROP TABLE cyydws.announce_data")
+    #     client.command(f"RENAME TABLE {temp_table} TO cyydws.announce_data")
+    #
+    #     return jsonify({
+    #         "success": True,
+    #         "status": 200,
+    #         "msg": f"成功删除 {len(ids)} 条数据",
+    #         "deleted_count": len(ids)
+    #     })
+    #
+    # except Exception as e:
+    #     print(f"删除数据异常: {str(e)}", exc_info=True)
+    #     return jsonify({
+    #         "success": False,
+    #         "msg": f"删除失败: {str(e)}",
+    #         "status": 500
+    #     })
 
-        # 1. 创建临时表
-        client.command(f"""
-            CREATE TABLE {temp_table} AS cyydws.announce_data
-            ENGINE = MergeTree()
-            ORDER BY id
-        """)
+        with client.cursor() as cursor:
+            # MySQL 使用简单的 DELETE 语句
+            placeholders = ','.join(['%s'] * len(ids))
+            delete_query = f"DELETE FROM announce_data WHERE id IN ({placeholders})"
+            cursor.execute(delete_query, ids)
+            client.commit()
 
-        # 2. 插入需要保留的数据
-        id_list = ",".join([f"'{id}'" for id in ids])
-        client.command(f"""
-            INSERT INTO {temp_table}
-            SELECT * FROM cyydws.announce_data
-            WHERE id NOT IN ({id_list})
-        """)
-
-        # 3. 删除原表并重命名临时表
-        client.command("DROP TABLE cyydws.announce_data")
-        client.command(f"RENAME TABLE {temp_table} TO cyydws.announce_data")
+            deleted_count = cursor.rowcount
 
         return jsonify({
             "success": True,
             "status": 200,
-            "msg": f"成功删除 {len(ids)} 条数据",
-            "deleted_count": len(ids)
+            "msg": f"成功删除 {deleted_count} 条数据",
+            "deleted_count": deleted_count
         })
 
     except Exception as e:
@@ -151,38 +180,39 @@ def search_data():
         # 执行搜索
         client = get_client()
         offset = (page - 1) * page_size
-
-        # 1. 查询分页数据（使用LIKE实现模糊搜索）
-        query_data = f'''
-            SELECT id, title, content, stock_num, date
-            FROM cyydws.announce_data
-            WHERE toString(stock_num) LIKE %(keyword)s
-            LIMIT {page_size} OFFSET {offset}
-        '''
-        # 添加通配符 % 实现部分匹配
         search_keyword = f'%{keyword}%'
-        result_data = client.query(query_data, {'keyword': search_keyword})
 
-        # 2. 查询总数据量（用于前端分页器）
-        query_total = '''
-            SELECT COUNT(*) 
-            FROM cyydws.announce_data
-            WHERE toString(stock_num) LIKE %(keyword)s
-        '''
-        result_total = client.query(query_total, {'keyword': search_keyword})
-        total = result_total.result_rows[0][0] if result_total.result_rows else 0
+        with client.cursor() as cursor:
+            # 1. 查询分页数据
+            query_data = '''
+                        SELECT id, title, content, stock_num, date
+                        FROM announce_data
+                        WHERE stock_num LIKE %s OR title LIKE %s OR content LIKE %s
+                        LIMIT %s OFFSET %s
+                    '''
+            cursor.execute(query_data, (search_keyword, search_keyword, search_keyword, page_size, offset))
+            result_data = cursor.fetchall()
 
-        # 格式化数据
-        data = [
-            {
-                "id": row[0],
-                "title": row[1],
-                "content": row[2],
-                "stock_num": row[3],
-                "date": row[4],
-            }
-            for row in result_data.result_rows
-        ]
+            # 2. 查询总数据量
+            query_total = '''
+                        SELECT COUNT(*) 
+                        FROM announce_data
+                        WHERE stock_num LIKE %s OR title LIKE %s OR content LIKE %s
+                    '''
+            cursor.execute(query_total, (search_keyword, search_keyword, search_keyword))
+            total = cursor.fetchone()['COUNT(*)']
+
+            # 格式化数据
+            data = [
+                {
+                    "id": row['id'],
+                    "title": row['title'],
+                    "content": row['content'],
+                    "stock_num": row['stock_num'],
+                    "date": str(row['date']) if row['date'] else None,
+                }
+                for row in result_data
+            ]
 
         return jsonify({
             "data": data,
@@ -221,20 +251,35 @@ def add_announcement():
         # 3. 获取数据库连接
         client = get_client()
 
-        # 4. 修改插入语句，使用 parseDateTimeBestEffort 或 toDate 函数
-        insert_query = """
-        INSERT INTO cyydws.announce_data 
-        (id, title, content, stock_num, date)
-        VALUES (%(id)s, %(title)s, %(content)s, %(stock_num)s, %(date)s)
-        """
+        # # 4. 修改插入语句，使用 parseDateTimeBestEffort 或 toDate 函数
+        # insert_query = """
+        # INSERT INTO cyydws.announce_data
+        # (id, title, content, stock_num, date)
+        # VALUES (%(id)s, %(title)s, %(content)s, %(stock_num)s, %(date)s)
+        # """
+        #
+        # client.command(insert_query, {
+        #     'id': announcement_id,
+        #     'title': title,
+        #     'content': content,
+        #     'stock_num': stock_num,
+        #     'date': date_str if date_str else datetime.now().strftime('%Y-%m-%d')
+        # })
 
-        client.command(insert_query, {
-            'id': announcement_id,
-            'title': title,
-            'content': content,
-            'stock_num': stock_num,
-            'date': date_str if date_str else datetime.now().strftime('%Y-%m-%d')
-        })
+        with client.cursor() as cursor:
+            insert_query = """
+            INSERT INTO announce_data 
+            (id, title, content, stock_num, date)
+            VALUES (%s, %s, %s, %s, %s)
+            """
+            cursor.execute(insert_query, (
+                announcement_id,
+                title,
+                content,
+                stock_num,
+                date_str if date_str else datetime.now().strftime('%Y-%m-%d')
+            ))
+            client.commit()
 
         return jsonify({
             "success": True,
@@ -261,10 +306,80 @@ def add_announcement():
 
 
 
+# @textPreprocess_bp.route('/textPreprocess_api/updateAnnouncement', methods=['POST'])
+# def update_announcement():
+#     try:
+#         # 1. 获取并验证请求数据
+#         data = request.get_json()
+#         if not data:
+#             return jsonify({"success": False, "msg": "请求数据不能为空", "status": 400})
+#
+#         announcement_id = data.get('id')
+#         if not announcement_id:
+#             return jsonify({"success": False, "msg": "公告ID不能为空", "status": 400})
+#
+#         title = data.get('title', '').strip()
+#         content = data.get('content', '').strip()
+#         if not title or not content:
+#             return jsonify({"success": False, "msg": "标题和内容不能为空", "status": 400})
+#
+#         # 2. 准备更新数据
+#         date_str = data.get('date')
+#         stock_num = data.get('stock_num', '未知')
+#
+#         # 3. 获取数据库连接
+#         client = get_client()
+#
+#         # 4. 检查公告是否存在
+#         check_query = "SELECT id FROM cyydws.announce_data WHERE id = %(id)s"
+#         check_result = client.query(check_query, {'id': announcement_id})
+#         if not check_result.result_rows:
+#             return jsonify({"success": False, "msg": "公告不存在", "status": 404})
+#
+#         # 5. 执行更新
+#         update_query = """
+#         ALTER TABLE cyydws.announce_data
+#         UPDATE
+#             title = %(title)s,
+#             content = %(content)s,
+#             stock_num = %(stock_num)s,
+#             date = parseDateTimeBestEffort(%(date)s)
+#         WHERE id = %(id)s
+#         """
+#
+#         client.command(update_query, {
+#             'id': announcement_id,
+#             'title': title,
+#             'content': content,
+#             'stock_num': stock_num,
+#             'date': date_str if date_str else datetime.now().strftime('%Y-%m-%d')
+#         })
+#
+#         return jsonify({
+#             "success": True,
+#             "status": 200,
+#             "msg": "公告更新成功",
+#             "data": {
+#                 "id": announcement_id,
+#                 "title": title,
+#                 "date": date_str
+#             }
+#         })
+#
+#     except Exception as e:
+#         print(f"更新公告失败: {str(e)}")
+#         import traceback
+#         traceback.print_exc()
+#
+#         return jsonify({
+#             "success": False,
+#             "msg": f"更新公告失败: {str(e)}",
+#             "status": 500
+#         })
+
 @textPreprocess_bp.route('/textPreprocess_api/updateAnnouncement', methods=['POST'])
 def update_announcement():
     try:
-        # 1. 获取并验证请求数据
         data = request.get_json()
         if not data:
             return jsonify({"success": False, "msg": "请求数据不能为空", "status": 400})
@@ -278,37 +393,35 @@ def update_announcement():
         if not title or not content:
             return jsonify({"success": False, "msg": "标题和内容不能为空", "status": 400})
 
-        # 2. 准备更新数据
         date_str = data.get('date')
         stock_num = data.get('stock_num', '未知')
 
-        # 3. 获取数据库连接
         client = get_client()
+        with client.cursor() as cursor:
+            # 检查公告是否存在
+            check_query = "SELECT id FROM announce_data WHERE id = %s"
+            cursor.execute(check_query, (announcement_id,))
+            if not cursor.fetchone():
+                return jsonify({"success": False, "msg": "公告不存在", "status": 404})
 
-        # 4. 检查公告是否存在
-        check_query = "SELECT id FROM cyydws.announce_data WHERE id = %(id)s"
-        check_result = client.query(check_query, {'id': announcement_id})
-        if not check_result.result_rows:
-            return jsonify({"success": False, "msg": "公告不存在", "status": 404})
-
-        # 5. 执行更新
-        update_query = """
-        ALTER TABLE cyydws.announce_data 
-        UPDATE 
-            title = %(title)s,
-            content = %(content)s,
-            stock_num = %(stock_num)s,
-            date = parseDateTimeBestEffort(%(date)s)
-        WHERE id = %(id)s
-        """
-
-        client.command(update_query, {
-            'id': announcement_id,
-            'title': title,
-            'content': content,
-            'stock_num': stock_num,
-            'date': date_str if date_str else datetime.now().strftime('%Y-%m-%d')
-        })
+            # 执行更新
+            update_query = """
+            UPDATE announce_data 
+            SET 
+                title = %s,
+                content = %s,
+                stock_num = %s,
+                date = %s
+            WHERE id = %s
+            """
+            cursor.execute(update_query, (
+                title,
+                content,
+                stock_num,
+                date_str if date_str else datetime.now().strftime('%Y-%m-%d'),
+                announcement_id
+            ))
+            client.commit()
 
         return jsonify({
             "success": True,
@@ -325,7 +438,6 @@ def update_announcement():
         print(f"更新公告失败: {str(e)}")
         import traceback
         traceback.print_exc()
-
         return jsonify({
             "success": False,
             "msg": f"更新公告失败: {str(e)}",
