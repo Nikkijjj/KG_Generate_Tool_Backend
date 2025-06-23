@@ -14,7 +14,7 @@ app = Flask(__name__)
 CORS(app, supports_credentials=True, origins=["http://localhost:8087"])
 # 注册 API
 app.register_blueprint(login_bp)
-app.register_blueprint(textPreprocess_bp, url_prefix='/api')
+app.register_blueprint(textPreprocess_bp)
 app.register_blueprint(projectManage_bp)
 app.register_blueprint(askAI_bp, url_prefix='/api')
 app.register_blueprint(dashboard_bp)
