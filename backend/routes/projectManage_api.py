@@ -37,24 +37,27 @@ def get_data_from_db(creator, page, pagesize):
             '''
             query_params = {"creator": creator, "limit": pagesize, "offset": offset}
 
-        # 查询总数
-        total_result = client.query(count_query, {"creator": creator} if creator != "admin" else {})
-        total = total_result.result_rows[0][0]
+        with client.cursor() as cursor:
+            if creator == "admin":
+                cursor.execute(count_query)
+            else:
+                cursor.execute(count_query, {"creator": creator})
+            total = cursor.fetchone()["count(*)"]
 
-        # 查询项目
-        project_result = client.query(project_query, query_params)
+            cursor.execute(project_query, query_params)
+            project_rows = cursor.fetchall()
 
         projects = [
             {
-                "id": row[0],
-                "project_name": row[1],
-                "project_desc": row[2],
-                "project_status": row[3],
-                "stock_num": row[4],
-                "create_time": row[5],
-                "creator": row[6]
+                "id": row["id"],
+                "project_name": row["project_name"],
+                "project_desc": row["project_desc"],
+                "project_status": row["project_status"],
+                "stock_num": row["stock_num"],
+                "create_time": row["create_time"],
+                "creator": row["creator"]
             }
-            for row in project_result.result_rows
+            for row in project_rows
         ]
 
         return {"projects": projects, "total": total}
@@ -67,11 +70,10 @@ def get_data_from_db(creator, page, pagesize):
 def delete_data_from_db(project_id):
     try:
         client = get_client()
-        delete_query = """
-            ALTER TABLE cyydws.graph_project DELETE WHERE id = %(id)s
-        """
-        print(project_id)
-        client.command(delete_query, {'id': project_id})
+        with client.cursor() as cursor:
+            delete_query = "DELETE FROM graph_project WHERE id = %s"
+            cursor.execute(delete_query, (project_id,))
+            client.commit()
 
         return {"status": 200, "msg": "删除成功"}
 
@@ -93,16 +95,18 @@ def add_data_from_db(project_name, project_desc, creator):
         data_list = []
         create_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')  # 当前时间
 
-        insert_query = f"""
-            INSERT INTO cyydws.graph_project (
+        with client.cursor() as cursor:
+            insert_query = """
+                INSERT INTO graph_project (
+                    id, project_name, project_desc,
+                    project_status, stock_num, data_list, create_time, creator
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            """
+            cursor.execute(insert_query, (
                 id, project_name, project_desc,
-                project_status, stock_num, data_list, create_time, creator
-            ) VALUES (
-                '{id}', '{project_name}', '{project_desc}',
-                '{project_status}', '{stock_num}', '{data_list}', '{create_time}', '{creator}'
-            )
-        """
-        client.query(insert_query)
+                project_status, str(stock_num), str(data_list), create_time, creator
+            ))
+            client.commit()
 
         return {"status": 200, "msg": "新增项目成功", "project_id": id}
 

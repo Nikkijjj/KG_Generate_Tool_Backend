@@ -125,18 +125,22 @@ def login():
     # 查询数据库验证用户
     client = get_client()
     try:
-        query = """
-        SELECT id, user_name, password 
-        FROM cyydws.user_data 
-        WHERE user_name = %(username)s
-        LIMIT 1
-        """
-        result = client.query(query, {'username': username})
+        with client.cursor() as cursor:
+            sql = """
+            SELECT id, user_name, password 
+            FROM user_data 
+            WHERE user_name = %s
+            LIMIT 1
+            """
+            cursor.execute(sql, (username,))
+            result = cursor.fetchone()
 
-        if not result.result_rows:
+        if not result:
             return jsonify({'status': 404, 'message': '用户不存在或已被禁用'}), 404
 
-        user_id, db_username, db_password = result.result_rows[0]
+        user_id = result['id']
+        db_username = result['user_name']
+        db_password = result['password']
 
         # 使用 bcrypt 验证密码
         if not verify_password(password, db_password):
