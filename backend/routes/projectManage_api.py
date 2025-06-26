@@ -66,12 +66,11 @@ def get_data_from_db(creator, page, pagesize):
         print(f'Error fetching data from database: {e}')
         return {"projects": [], "total": 0}
 
-
 def delete_data_from_db(project_id):
     try:
         client = get_client()
         with client.cursor() as cursor:
-            delete_query = "DELETE FROM graph_project WHERE id = %s"
+            delete_query = "DELETE FROM cyydws.graph_project WHERE id = %s"
             cursor.execute(delete_query, (project_id,))
             client.commit()
 
@@ -89,15 +88,23 @@ def add_data_from_db(project_name, project_desc, creator):
     try:
         client = get_client()
 
-        id = generate_project_id()  # 生成随机项目 ID
         project_status = 0
         stock_num = []
         data_list = []
         create_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')  # 当前时间
 
         with client.cursor() as cursor:
+            # 循环生成唯一 ID
+            while True:
+                id = generate_project_id()
+                cursor.execute("SELECT COUNT(*) as count FROM cyydws.graph_project WHERE id = %s", (id,))
+                result = cursor.fetchone()
+                if result['count'] == 0:
+                    break  # ID 不存在，可以使用
+
+            # 插入数据
             insert_query = """
-                INSERT INTO graph_project (
+                INSERT INTO cyydws.graph_project (
                     id, project_name, project_desc,
                     project_status, stock_num, data_list, create_time, creator
                 ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
@@ -113,6 +120,32 @@ def add_data_from_db(project_name, project_desc, creator):
     except Exception as e:
         print(f'Error adding project: {e}')
         return {"status": 500, "msg": "新增项目失败，请稍后重试", "project_id": "0"}
+
+    finally:
+        client.close()
+
+def edit_data_from_db(project_name, project_desc, project_id):
+    try:
+        client = get_client()
+        with client.cursor() as cursor:
+            update_query = """
+                UPDATE cyydws.graph_project
+                SET project_name = %s,
+                    project_desc = %s
+                WHERE id = %s
+            """
+            cursor.execute(update_query, (project_name, project_desc, project_id))
+            client.commit()
+
+        return {"status": 200, "msg": "修改项目成功", "project_id": project_id}
+
+    except Exception as e:
+        print(f'Error editing project: {e}')
+        return {"status": 500, "msg": "修改项目失败", "project_id": project_id}
+
+    finally:
+        client.close()
+
 
 @projectManage_bp.route('/getProjectList', methods=['POST'])
 def get_projects():
@@ -148,6 +181,21 @@ def add_project():
     project_desc = data.get("project_desc")
     creator = data.get("creator")
     result = add_data_from_db(project_name, project_desc, creator)
+    return jsonify({
+        "status": result["status"],
+        "msg": result["msg"],
+        "project_id": result["project_id"]
+    })
+
+
+@projectManage_bp.route('/editProject', methods=['POST'])
+def edit_project():
+    """ 获取项目列表的 API """
+    data = request.get_json()
+    project_name = data.get("project_name")
+    project_desc = data.get("project_desc")
+    id = data.get("project_id")
+    result = edit_data_from_db(project_name, project_desc, id)
     return jsonify({
         "status": result["status"],
         "msg": result["msg"],
