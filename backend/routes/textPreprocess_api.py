@@ -444,3 +444,150 @@ def update_announcement():
             "status": 500
         })
 
+
+@textPreprocess_bp.route('/textPreprocess_api/uploadAnnouncements', methods=['POST'])
+def upload_announcements():
+    try:
+        if 'file' not in request.files:
+            return jsonify({"success": False, "msg": "没有上传文件", "status": 400})
+
+        file = request.files['file']
+        if file.filename == '':
+            return jsonify({"success": False, "msg": "没有选择文件", "status": 400})
+
+        file_type = request.form.get('fileType', 'csv')
+        delimiter = request.form.get('delimiter', ',')
+
+        announcements = []
+        if file_type == 'csv':
+            import csv
+            from io import StringIO
+
+            content = file.read().decode('utf-8')
+            reader = csv.reader(StringIO(content), delimiter=delimiter)
+            headers = next(reader, [])
+
+            required_fields = ['title', 'content']
+            for field in required_fields:
+                if field not in headers:
+                    return jsonify({
+                        "success": False,
+                        "msg": f"CSV文件缺少必要字段: {field}",
+                        "status": 400
+                    })
+
+            for row in reader:
+                if len(row) != len(headers):
+                    continue
+
+                announcement = dict(zip(headers, row))
+
+                # 处理日期字段
+                if 'date' in announcement and announcement['date']:
+                    import re
+                    if not re.match(r'^\d{4}-\d{2}-\d{2}$', announcement['date']):
+                        try:
+                            dt = datetime.strptime(announcement['date'], '%Y/%m/%d')
+                            announcement['date'] = dt.strftime('%Y-%m-%d')
+                        except ValueError:
+                            announcement['date'] = datetime.now().strftime('%Y-%m-%d')
+                else:
+                    announcement['date'] = datetime.now().strftime('%Y-%m-%d')
+
+                announcement['id'] = announcement.get('id') or f"ann_{datetime.now().strftime('%Y%m%d%H%M%S')}_{len(announcements)}"
+                announcement['stock_num'] = announcement.get('stock_num') or '未知'
+
+                announcements.append(announcement)
+
+        elif file_type == 'txt':
+            content = file.read().decode('utf-8')
+            entries = content.split('\n\n')
+
+            for entry in entries:
+                if not entry.strip():
+                    continue
+
+                announcement = {
+                    'id': f"ann_{datetime.now().strftime('%Y%m%d%H%M%S')}_{len(announcements)}",
+                    'title': '无标题公告',
+                    'content': '',
+                    'date': datetime.now().strftime('%Y-%m-%d'),
+                    'stock_num': '未知'
+                }
+
+                lines = entry.split('\n')
+                for line in lines:
+                    if line.startswith('公告标题：'):
+                        announcement['title'] = line.replace('公告标题：', '').strip()
+                    elif line.startswith('公告内容：'):
+                        announcement['content'] = line.replace('公告内容：', '').strip()
+                    elif line.startswith('发布时间：'):
+                        date_str = line.replace('发布时间：', '').strip()
+                        import re
+                        if re.match(r'^\d{4}-\d{2}-\d{2}$', date_str):
+                            announcement['date'] = date_str
+                        else:
+                            try:
+                                dt = datetime.strptime(date_str, '%Y/%m/%d')
+                                announcement['date'] = dt.strftime('%Y-%m-%d')
+                            except ValueError:
+                                announcement['date'] = datetime.now().strftime('%Y-%m-%d')
+                    elif line.startswith('股票代码：'):
+                        announcement['stock_num'] = line.replace('股票代码：', '').strip()
+
+                announcements.append(announcement)
+
+        if announcements:
+            client = get_client()
+
+            try:
+                with client.cursor() as cursor:
+                    values = []
+                    for ann in announcements:
+                        values.append((
+                            ann['id'],
+                            ann['title'],
+                            ann['content'],
+                            ann['stock_num'],
+                            ann['date']
+                        ))
+
+                    insert_query = """
+                    INSERT INTO announce_data 
+                    (id, title, content, stock_num, date)
+                    VALUES (%s, %s, %s, %s, %s)
+                    """
+                    cursor.executemany(insert_query, values)
+                    client.commit()
+
+                return jsonify({
+                    "success": True,
+                    "msg": f"成功导入 {len(announcements)} 条公告数据",
+                    "count": len(announcements),
+                    "status": 200
+                })
+
+            except Exception as e:
+                client.rollback()
+                raise e
+
+            finally:
+                client.close()
+
+        else:
+            return jsonify({
+                "success": False,
+                "msg": "文件中没有有效的公告数据",
+                "status": 400
+            })
+
+    except Exception as e:
+        print(f"上传公告文件失败: {str(e)}")
+        import traceback
+        traceback.print_exc()
+
+        return jsonify({
+            "success": False,
+            "msg": f"上传失败: {str(e)}",
+            "status": 500
+        })
