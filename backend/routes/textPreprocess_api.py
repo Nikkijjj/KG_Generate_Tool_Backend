@@ -185,22 +185,23 @@ def search_data():
         with client.cursor() as cursor:
             # 1. 查询分页数据
             query_data = '''
-                        SELECT id, title, content, stock_num, date
-                        FROM announce_data
-                        WHERE stock_num LIKE %s OR title LIKE %s OR content LIKE %s
-                        LIMIT %s OFFSET %s
-                    '''
+                SELECT id, title, content, stock_num, date
+                FROM announce_data
+                WHERE stock_num LIKE %s OR title LIKE %s OR content LIKE %s
+                LIMIT %s OFFSET %s
+            '''
             cursor.execute(query_data, (search_keyword, search_keyword, search_keyword, page_size, offset))
             result_data = cursor.fetchall()
 
             # 2. 查询总数据量
             query_total = '''
-                        SELECT COUNT(*) 
-                        FROM announce_data
-                        WHERE stock_num LIKE %s OR title LIKE %s OR content LIKE %s
-                    '''
+                SELECT COUNT(*) as total
+                FROM announce_data
+                WHERE stock_num LIKE %s OR title LIKE %s OR content LIKE %s
+            '''
             cursor.execute(query_total, (search_keyword, search_keyword, search_keyword))
-            total = cursor.fetchone()['COUNT(*)']
+            total_result = cursor.fetchone()
+            total = total_result['total'] if total_result else 0
 
             # 格式化数据
             data = [
@@ -215,8 +216,10 @@ def search_data():
             ]
 
         return jsonify({
-            "data": data,
-            "total": total,
+            "data": {
+                "data": data,
+                "total": total
+            },
             "status": 200
         })
 
@@ -225,7 +228,10 @@ def search_data():
         return jsonify({
             'status': 500,
             "message": str(e),
-            "data": []
+            "data": {
+                "data": [],
+                "total": 0
+            }
         }), 500
 
 
