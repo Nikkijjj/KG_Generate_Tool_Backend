@@ -14,18 +14,38 @@ import networkx as nx
 import openai
 from typing import Dict
 import os
+from neo4j import GraphDatabase
 
 llmGenKG_bp = Blueprint('llmGenKG', __name__)
 
 # 配置部分
 MYSQL_CONFIG = {
-    'host': '192.168.3.111',
+    'host': '172.18.18.5',
     'port': 3306,
     'user': 'jhy',
     'password': '123456',
     'database': 'cyydws',
     'charset': 'utf8mb4'
 }
+
+# Neo4j 配置
+NEO4J_URI = "bolt://localhost:7687"
+NEO4J_USER = "neo4j"
+NEO4J_PASSWORD = "20040725"
+
+
+class Neo4jConnection:
+    def __init__(self, uri, user, password):
+        self.driver = GraphDatabase.driver(uri, auth=(user, password))
+
+    def close(self):
+        self.driver.close()
+
+    def execute_query(self, query, parameters=None):
+        with self.driver.session() as session:
+            result = session.run(query, parameters)
+            return list(result)
+
 
 # DeepSeek API配置
 DEEPSEEK_API_KEY = "sk-c886ee978dec45bfa1f184d64cddbc78"
@@ -63,7 +83,8 @@ def extract_nodes_with_llm(combined_text: str, project_id: str) -> Dict:
         1. 从文本中提取两类节点：
            - 事件节点(type=1): 表示发生的事件或动作，通常是动词或动名词短语
            - 实体节点(type=0): 表示参与事件的实体，通常是名词或名词短语
-             示例: "公司", "董事会", "股东", "合同", "金额"
+
+        2.抽取出的节点不能是笼统的词语（比如公司、公告这种是不行的，没有指导意义），需要具体一些。
 
         2. 节点类型判断规则：
            - 如果一个词或短语表示的是具体的动作或变化，标记为事件节点(type=1)
@@ -96,7 +117,7 @@ def extract_nodes_with_llm(combined_text: str, project_id: str) -> Dict:
                     "properties": {{
                         "source": "LLM抽取",
                         "project_id": "项目ID",
-                        "context": "相关上下文(可选)"
+                        "context": "相关上下文（必须有）"
                     }}
                 }},
                 ...
@@ -686,60 +707,112 @@ def extract_relations_with_llm(nodes: list, relation_type: str, project_id: str,
 
 def get_announcements_by_project(project_id: str) -> list:
     """根据项目ID获取相关公告数据"""
-    engine = get_sqlalchemy_engine()
+    client = None
+    cursor = None
     try:
-        # 先查询项目关联的公告ID
-        with engine.connect() as connection:
-            query = text("""
-                SELECT announcement_ids FROM project_table 
-                WHERE id = :project_id
-            """)
-            result = connection.execute(query, {"project_id": project_id})
-            row = result.fetchone()
-            if not row or not row.announcement_ids:
-                return []
+        client = get_client()
+        cursor = client.cursor()
 
-            announcement_ids = json.loads(row.announcement_ids)
+        # 获取项目中的公告ID列表
+        project_query = "SELECT data_list FROM cyydws.graph_project WHERE id = %s"
+        cursor.execute(project_query, (project_id,))
+        project_result = cursor.fetchone()
 
-            # 查询公告详情
-            query = text("""
-                SELECT id, title, content, date, stock_num 
-                FROM announce_data
-                WHERE id IN :ids
-                ORDER BY date DESC
-                LIMIT 10  # 限制数量防止过大
-            """)
-            result = connection.execute(query, {"ids": tuple(announcement_ids)})
-            return [
-                {
-                    "id": row.id,
-                    "title": row.title,
-                    "content": row.content,
-                    "date": row.date,
-                    "stock_num": row.stock_num
-                }
-                for row in result
-            ]
+        if not project_result:
+            return []
+
+        id_list = []
+        if project_result['data_list']:
+            try:
+                id_list = json.loads(project_result['data_list'])
+                if not isinstance(id_list, list):
+                    id_list = []
+            except json.JSONDecodeError:
+                id_list = []
+
+        if not id_list:
+            return []
+
+        # 构建IN查询参数
+        placeholders = ','.join(['%s'] * len(id_list))
+        announcement_query = f"""
+            SELECT id, title, content, date, stock_num 
+            FROM cyydws.announce_data
+            WHERE id IN ({placeholders})
+            ORDER BY date DESC
+            LIMIT 10  # 保持与原函数相同的限制
+        """
+        cursor.execute(announcement_query, tuple(id_list))
+        result = cursor.fetchall()
+
+        formatted_data = []
+        for row in result:
+            formatted_data.append({
+                "id": str(row['id']),
+                "title": row['title'],
+                "content": row['content'],
+                "date": str(row['date']) if row['date'] else '',
+                "stock_num": row['stock_num']
+            })
+
+        return formatted_data
+
     except Exception as e:
         print(f"获取公告数据异常: {str(e)}")
         traceback.print_exc()
         return []
     finally:
-        engine.dispose()
+        if cursor:
+            cursor.close()
+        if client:
+            client.close()
 
 
-def save_edges_to_database(edges: list, project_id: str):
-    """将边(关系)保存到数据库"""
+def save_edges_to_databases(edges: list, project_id: str, relation_type: str = None):
+    """将边(关系)保存到 MySQL 和 Neo4j"""
+    # 保存到 MySQL
+    mysql_success = save_edges_to_mysql(edges, project_id, relation_type)
+
+    # 保存到 Neo4j
+    neo4j_success = save_edges_to_neo4j(edges, project_id)
+
+    return mysql_success and neo4j_success
+
+
+def save_edges_to_mysql(edges: list, project_id: str, relation_type: str = None):
+    """将边(关系)保存到 MySQL"""
     engine = get_sqlalchemy_engine()
     try:
         with engine.connect() as connection:
-            # 先删除该项目之前的关系
-            delete_stmt = text("DELETE FROM edge_table WHERE project_id = :project_id")
-            connection.execute(delete_stmt, {"project_id": project_id})
+            # 根据关系类型决定删除策略
+            if relation_type == 'general':
+                # 通用关系抽取时删除所有关系
+                delete_stmt = text("DELETE FROM edge_table WHERE project_id = :project_id")
+                connection.execute(delete_stmt, {"project_id": project_id})
+            elif relation_type:
+                # 特定类型关系抽取时只删除该类型的关系
+                delete_stmt = text("""
+                    DELETE FROM edge_table 
+                    WHERE project_id = :project_id AND properties->>'$.extraction_method' = :relation_type
+                """)
+                connection.execute(delete_stmt, {
+                    "project_id": project_id,
+                    "relation_type": relation_type
+                })
+            else:
+                # 没有指定类型时删除所有关系
+                delete_stmt = text("DELETE FROM edge_table WHERE project_id = :project_id")
+                connection.execute(delete_stmt, {"project_id": project_id})
+
             connection.commit()
 
             # 插入新关系
             for edge in edges:
+                # 确保properties包含extraction_method
+                properties = edge.get("properties", {})
+                if relation_type and 'extraction_method' not in properties:
+                    properties['extraction_method'] = relation_type
+
                 insert_stmt = text("""
                     INSERT INTO edge_table 
                     (id, type, `from`, `to`, eventRel, value, properties, project_id) 
@@ -753,15 +826,113 @@ def save_edges_to_database(edges: list, project_id: str):
                     "to": edge["to"],
                     "eventRel": edge["eventRel"],
                     "value": edge["value"],
-                    "properties": json.dumps(edge.get("properties", {})),
+                    "properties": json.dumps(properties),
                     "project_id": project_id
                 })
             connection.commit()
         return True
     except Exception as e:
-        print(f"保存关系到数据库失败: {str(e)}")
+        print(f"保存关系到 MySQL 失败: {str(e)}")
         traceback.print_exc()
         return False
+    finally:
+        engine.dispose()
+
+
+def save_edges_to_neo4j(edges: list, project_id: str):
+    """将边(关系)保存到 Neo4j"""
+    neo4j = Neo4jConnection(NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD)
+    try:
+        # 第一步：删除项目中已有的数据
+        print(f"[Neo4j] 开始清理项目 {project_id} 的旧数据...")
+
+        # 删除关系
+        delete_rels_query = """
+            MATCH ()-[r]-()
+            WHERE r.project_id = $project_id
+            DELETE r
+        """
+        rels_deleted = neo4j.execute_query(delete_rels_query, {"project_id": project_id})
+        print(f"[Neo4j] 已删除 {len(rels_deleted)} 条关系")
+
+        # 删除节点
+        delete_nodes_query = """
+            MATCH (n:KnowledgeNode)
+            WHERE n.project_id = $project_id
+            DELETE n
+        """
+        nodes_deleted = neo4j.execute_query(delete_nodes_query, {"project_id": project_id})
+        print(f"[Neo4j] 已删除 {len(nodes_deleted)} 个节点")
+
+        # 第二步：获取所有节点
+        print(f"[Neo4j] 准备导入新数据...")
+        nodes = get_nodes_from_database(project_id)
+        nodes_map = {node['id']: node for node in nodes}
+
+        # 第三步：创建节点
+        print(f"[Neo4j] 正在创建 {len(nodes)} 个节点...")
+        print("node数据", nodes)
+        for node in nodes:
+            node_type = "事件" if node['type'] == '1' else "实体"
+
+            query = """
+                MERGE (n:KnowledgeNode {id: $id})
+                SET n.type = $type,
+                    n.value = $value,
+                    n.key = $key,
+                    n.name = $key,  
+                    n.project_id = $project_id,
+                    n += $properties
+            """
+            neo4j.execute_query(query, {
+                "id": node['id'],
+                "type": node_type,
+                "value": node['value'],
+                "key": node['key'],
+                "project_id": project_id,
+                "properties": node.get('properties', {})
+            })
+
+        # 第四步：创建关系
+        print(f"[Neo4j] 正在创建 {len(edges)} 条关系...")
+        for edge in edges:
+            from_node = nodes_map.get(edge['from'])
+            to_node = nodes_map.get(edge['to'])
+
+            if not from_node or not to_node:
+                print(f"[Neo4j] 警告: 跳过无效关系，节点不存在: {edge['from']} -> {edge['to']}")
+                continue
+
+            # 定义关系类型
+            rel_type = edge['type'].replace("关系", "").upper()
+
+            query = """
+                MATCH (a:KnowledgeNode {id: $from_id})
+                MATCH (b:KnowledgeNode {id: $to_id})
+                MERGE (a)-[r:%s]->(b)
+                SET r.value = $value,
+                    r.eventRel = $eventRel,
+                    r.project_id = $project_id,
+                    r += $properties
+            """ % rel_type
+
+            neo4j.execute_query(query, {
+                "from_id": edge['from'],
+                "to_id": edge['to'],
+                "value": edge['value'],
+                "eventRel": edge['eventRel'],
+                "project_id": project_id,
+                "properties": edge.get('properties', {})
+            })
+
+        print("[Neo4j] 数据导入完成")
+        return True
+    except Exception as e:
+        print(f"[Neo4j] 保存关系到 Neo4j 失败: {str(e)}")
+        traceback.print_exc()
+        return False
+    finally:
+        neo4j.close()
 
 
 # 保留原有的关系抽取API
@@ -853,24 +1024,10 @@ def extract_relations_api():
             }
             frontend_edges.append(frontend_edge)
 
-        # 保存关系到数据库（只保存必要信息）
-        db_edges = []
-        for edge in edges:
-            db_edge = {
-                "id": edge["id"],
-                "type": edge["type"],
-                "from": edge["from"],
-                "to": edge["to"],
-                "value": edge["value"],
-                "eventRel": edge["eventRel"],
-                "properties": edge["properties"],
-                "project_id": project_id
-            }
-            db_edges.append(db_edge)
-
-        if db_edges:
+        # 保存关系到数据库（MySQL 和 Neo4j）
+        if edges:
             print("[关系抽取API] 正在保存关系到数据库...")
-            save_success = save_edges_to_database(db_edges, project_id)
+            save_success = save_edges_to_databases(edges, project_id, relation_type)
             if not save_success:
                 print("[关系抽取API] 错误: 保存关系到数据库失败")
                 return jsonify({
@@ -901,10 +1058,9 @@ def extract_relations_api():
         }), 500
 
 
-
 @llmGenKG_bp.route('/delete_edges_by_project', methods=['POST'])
 def delete_edges_by_project():
-    """根据项目ID删除所有关系"""
+    """根据项目ID删除所有关系（MySQL 和 Neo4j）"""
     engine = None
     try:
         # 获取项目ID（支持两种方式）
@@ -925,6 +1081,7 @@ def delete_edges_by_project():
                 'status': 400
             }), 400
 
+        # 删除 MySQL 中的关系
         engine = get_sqlalchemy_engine()
         with engine.connect() as connection:
             # 删除该项目所有关系
@@ -933,17 +1090,22 @@ def delete_edges_by_project():
             connection.commit()
 
             deleted_count = result.rowcount
-            print(f"已删除项目 {project_id} 的 {deleted_count} 条关系")
+            print(f"已删除项目 {project_id} 的 {deleted_count} 条 MySQL 关系")
 
-            return jsonify({
-                'success': True,
-                'message': f'成功删除 {deleted_count} 条关系',
-                'status': 200,
-                'data': {
-                    'deleted_count': deleted_count,
-                    'project_id': project_id
-                }
-            })
+        # 删除 Neo4j 中的关系
+        neo4j_success = delete_neo4j_project_data(project_id)
+        if not neo4j_success:
+            raise Exception("删除 Neo4j 数据失败")
+
+        return jsonify({
+            'success': True,
+            'message': f'成功删除 {deleted_count} 条关系',
+            'status': 200,
+            'data': {
+                'deleted_count': deleted_count,
+                'project_id': project_id
+            }
+        })
 
     except Exception as e:
         print(f"删除关系异常: {str(e)}")
@@ -958,9 +1120,37 @@ def delete_edges_by_project():
             engine.dispose()
 
 
-@llmGenKG_bp.route('/get_full_graph_data', methods=['GET'])
-def get_full_graph_data():
-    """获取完整的图谱数据（节点+边，包含完整节点信息）"""
+def delete_neo4j_project_data(project_id: str):
+    """删除 Neo4j 中指定项目的所有数据"""
+    neo4j = Neo4jConnection(NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD)
+    try:
+        # 删除关系
+        query = """
+            MATCH ()-[r]-()
+            WHERE r.project_id = $project_id
+            DELETE r
+        """
+        neo4j.execute_query(query, {"project_id": project_id})
+
+        # 删除节点
+        query = """
+            MATCH (n:KnowledgeNode)
+            WHERE n.project_id = $project_id
+            DELETE n
+        """
+        neo4j.execute_query(query, {"project_id": project_id})
+
+        return True
+    except Exception as e:
+        print(f"删除 Neo4j 项目数据失败: {str(e)}")
+        return False
+    finally:
+        neo4j.close()
+
+
+@llmGenKG_bp.route('/get_neo4j_graph', methods=['GET'])
+def get_neo4j_graph():
+    """从 Neo4j 获取图谱数据"""
     try:
         project_id = request.args.get('project_id')
         if not project_id:
@@ -970,56 +1160,68 @@ def get_full_graph_data():
                 'status': 400
             }), 400
 
-        # 获取节点
-        nodes = get_nodes_from_database(project_id)
-        nodes_map = {node['id']: node for node in nodes}
+        neo4j = Neo4jConnection(NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD)
 
-        # 获取边
-        edges = []
-        engine = get_sqlalchemy_engine()
-        with engine.connect() as connection:
-            query = text("""
-                SELECT id, type, `from`, `to`, eventRel, value, properties 
-                FROM edge_table 
-                WHERE project_id = :project_id
-            """)
-            result = connection.execute(query, {"project_id": project_id})
+        # 查询节点
+        nodes_query = """
+            MATCH (n:KnowledgeNode)
+            WHERE n.project_id = $project_id
+            RETURN n
+        """
+        nodes = neo4j.execute_query(nodes_query, {"project_id": project_id})
 
-            for row in result:
-                from_node = nodes_map.get(row.from_)
-                to_node = nodes_map.get(row.to)
+        # 查询关系
+        edges_query = """
+            MATCH (a)-[r]->(b)
+            WHERE r.project_id = $project_id
+            RETURN a, r, b
+        """
+        edges = neo4j.execute_query(edges_query, {"project_id": project_id})
 
-                if not from_node or not to_node:
-                    continue  # 跳过无效关系
+        # 格式化结果
+        formatted_nodes = []
+        for record in nodes:
+            node = record['n']
+            formatted_nodes.append({
+                "id": node["id"],
+                "type": node["type"],
+                "value": node["value"],
+                "key": node["key"],
+                "properties": dict(node)
+            })
 
-                edges.append({
-                    "id": row.id,
-                    "type": row.type,
-                    "from": row.from_,
-                    "to": row.to,
-                    "from_node": from_node,
-                    "to_node": to_node,
-                    "value": row.value,
-                    "eventRel": row.eventRel,
-                    "properties": json.loads(row.properties) if isinstance(row.properties, str) else row.properties
-                })
+        formatted_edges = []
+        for record in edges:
+            a = record['a']
+            r = record['r']
+            b = record['b']
+            formatted_edges.append({
+                "from": a["id"],
+                "to": b["id"],
+                "type": type(r).__name__,
+                "value": r["value"],
+                "eventRel": r["eventRel"],
+                "properties": dict(r)
+            })
 
         return jsonify({
             'success': True,
-            'message': '获取图谱数据成功',
+            'message': '获取 Neo4j 图谱数据成功',
             'status': 200,
             'data': {
-                'nodes': nodes,
-                'edges': edges,
+                'nodes': formatted_nodes,
+                'edges': formatted_edges,
                 'project_id': project_id
             }
         })
     except Exception as e:
         return jsonify({
             'success': False,
-            'message': f'获取图谱数据失败: {str(e)}',
+            'message': f'获取 Neo4j 图谱数据失败: {str(e)}',
             'status': 500
         }), 500
+    finally:
+        neo4j.close()
 
 
 def get_nodes_from_database(project_id: str) -> list:
