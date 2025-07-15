@@ -18,7 +18,8 @@ def get_client():
     获取 MySQL 数据库连接
     """
     connection = pymysql.connect(
-        host='192.168.3.111',      # MySQL 服务器地址
+        # host='192.168.3.111',      # MySQL 服务器地址
+        host = '172.18.18.5',
         user='jhy',  # 用户名
         password='123456',  # 密码
         database='cyydws',     # 数据库名

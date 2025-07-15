@@ -15,9 +15,12 @@ BASE_URL = "https://api.agicto.cn/v1"
 EMBED_MODEL = "text-embedding-3-small"
 CHAT_MODEL = "deepseek-chat"
 
-NEO4J_URI = "neo4j://localhost:7687"
+# NEO4J_URI = "neo4j://localhost:7687"
+# NEO4J_USER = "neo4j"
+# NEO4J_PASSWORD = "24721tianyue@"
+NEO4J_URI = "bolt://172.18.18.5:7687"
 NEO4J_USER = "neo4j"
-NEO4J_PASSWORD = "24721tianyue@"
+NEO4J_PASSWORD = "20040725"
 driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
 
 class DeepSeekEmbedder(Embedder):
@@ -71,37 +74,57 @@ class DeepSeekChatLLM(LLMInterface):
 embedder = DeepSeekEmbedder()
 retriever = VectorRetriever(
     driver=driver,
-    index_name="newsEmbedding",
+    index_name="contentEmbedding",
     embedder=embedder,
-    return_properties=["title", "content"]
+    return_properties=["context"]
 )
 llm = DeepSeekChatLLM()
 rag = GraphRAG(retriever=retriever, llm=llm)
 
-# TODO 这里应该只对projectId有关节点进行编码
-def update_news_embeddings(projectId):
+# 这里只对包含project_id属性的KnowledgeNode类型节点进行编码，对节点的context属性进行编码
+def update_embeddings(projectId):
     with driver.session() as session:
         result = session.run(
-            "MATCH (n:News) WHERE n.embedding IS NULL RETURN elementId(n) AS id, n.title AS title, n.content AS content"
+            """
+            MATCH (n:KnowledgeNode)
+            WHERE n.project_id = $projectId AND n.embedding IS NULL AND n.context IS NOT NULL
+            RETURN elementId(n) AS id, n.context AS context
+            """,
+            {"projectId": projectId}
         )
+
         for record in result:
-            news_id = record["id"]
-            text = (record["title"] or "") + "\n" + (record["content"] or "")
+            node_id = record["id"]
+            context = record["context"]
+            if not context:
+                print(f"Skipping node with id {node_id} because it has no context")
+                continue
+
             try:
-                embedding = embedder.embed_query(text)
+                embedding = embedder.embed_query(context)
                 session.run(
-                    "MATCH (n) WHERE elementId(n) = $id SET n.embedding = $embedding",
-                    {"id": news_id, "embedding": embedding}
+                    """
+                    MATCH (n)
+                    WHERE elementId(n) = $id
+                    SET n.embedding = $embedding
+                    """,
+                    {"id": node_id, "embedding": embedding}
                 )
-                print(f"embedding stored for news_id {news_id}")
+                print(f"Embedding stored for node_id {node_id}")
             except Exception as e:
-                print(f"embedding failed for news_id {news_id}: {e}")
+                print(f"Embedding failed for node_id {node_id}: {e}")
 
 
-# TODO 这里应该添加projectId为每个节点的属性，查询的时候将查询范围限制在该ProjectId下
-def ask_question(query_text):
-    response = rag.search(query_text=query_text, retriever_config={"top_k": 5})
-    print(response.answer)
+# 查询的时候，应该只查询KnowledgeNode类型且project_id属性等于传入的projectId的节点
+def ask_question(query_text, projectId):
+    retriever_config = {
+        "top_k": 5,
+        "filters": {
+            "project_id": projectId
+        }
+    }
+    response = rag.search(query_text=query_text, retriever_config=retriever_config)
+    print(f"\nLLM Answer:\n{response.answer}")
     return response.answer
 
 @askAI_bp.route("/askAI", methods = ['POST'])
@@ -109,9 +132,10 @@ def getAIResponse():
     data = request.get_json()
     projectId = data.get("id")
     query = data.get("query")
+    print(projectId)
     print(query)
-    update_news_embeddings(projectId)
-    answer = ask_question(query)
+    update_embeddings(projectId)
+    answer = ask_question(query, projectId)
     return jsonify({
         "status": 200,
         "answer": answer
