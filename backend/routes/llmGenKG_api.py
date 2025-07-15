@@ -84,7 +84,7 @@ def extract_nodes_with_llm(combined_text: str, project_id: str) -> Dict:
            - 事件节点(type=1): 表示发生的事件或动作，通常是动词或动名词短语
            - 实体节点(type=0): 表示参与事件的实体，通常是名词或名词短语
 
-        2.抽取出的节点不能是笼统的词语（比如公司、公告这种是不行的，没有指导意义），需要具体一些。
+        2.抽取出的节点不能是笼统的词语（比如“公司”、“公告”这种简单笼统的词是不行的，没有指导意义），需要具体一些，比如说公司要写完整公司名称。
 
         2. 节点类型判断规则：
            - 如果一个词或短语表示的是具体的动作或变化，标记为事件节点(type=1)
@@ -496,7 +496,7 @@ RELATION_PROMPTS = {
    - to: 结果/后果的节点ID
    - type: "因果关系"
    - value: 具体关系描述(如"导致","引发")
-   - properties: 相关属性(如置信度、来源等)
+   - context：描述该关系的上下文内容（相关文本片段），必须抽出来
 
 3. 返回json格式示例：
 {
@@ -506,10 +506,7 @@ RELATION_PROMPTS = {
             "to": "节点2ID",
             "type": "因果关系",
             "value": "导致",
-            "properties": {
-                "confidence": 0.9,
-                "context": "相关文本片段"
-            }
+            "context": "相关文本片段（必须有），要体现因果关系的内容，尽量详细"
         }
     ]
 }""",
@@ -524,8 +521,8 @@ RELATION_PROMPTS = {
    - from: 前序节点ID
    - to: 后续节点ID
    - type: "时序关系" 
-   - value: 具体关系描述(如"之后","随后")
-   - properties: 相关属性(如时间间隔、来源等)
+   - value: 具体关系描述(如"之后","之前")
+   - context：描述该关系的上下文内容（相关文本片段），必须抽出来
 
 3. 返回json格式示例：
 {
@@ -535,51 +532,67 @@ RELATION_PROMPTS = {
             "to": "节点2ID",
             "type": "时序关系",
             "value": "之后",
-            "properties": {
-                "time_interval": "3个月",
-                "context": "相关文本片段"
-            }
+            "context": "相关文本片段（必须有），要体现时序关系的内容，尽量详细"
         }
     ]
 }""",
 
     'general': """你是一个专业的金融关系抽取系统，分析上市公司公告中的各类关系。请严格按以下要求操作并以json格式返回结果：
 
-1. 分析以下节点之间的关系：
-   - 因果关系 (如: 业绩下滑 → 股价下跌)
-   - 时序关系 (如: 董事会决议 → 股东大会审议)
-   - 其他典型关系 (如: 公司 → 子公司)
+    1. 主要分析以下关系类型：
+       - 因果关系 (如: 业绩下滑 → 股价下跌)
+       - 时序关系 (如: 董事会决议 → 股东大会审议)
+       - 其他语义关系（需根据上下文智能判断具体类型）
 
-2. 每种关系必须包含：
-   - from: 起始节点ID
-   - to: 目标节点ID
-   - type: 关系类型("因果关系"/"时序关系"/"其他关系")
-   - value: 具体关系描述
-   - properties: 相关属性
+    2. 每种关系必须包含：
+       - from: 起始节点ID
+       - to: 目标节点ID
+       - type: 关系类型（优先使用"因果关系"/"时序关系"，其他情况应准确概括关系本质）
+       - value: 具体关系描述动词/短语
+       - context: 对关系本质的简要说明（必须有），如果因果关系，要突出因果上下文；如果是时序关系，要突出时序上下文；其他关系自己分析总结
 
-3. 返回json格式示例：
-{
-    "edges": [
-        {
-            "from": "节点1ID",
-            "to": "节点2ID",
-            "type": "因果关系",
-            "value": "导致",
-            "properties": {
-                "confidence": 0.9
+    3. 关系类型判断原则：
+       - 当存在明确因果逻辑时用"因果关系"
+       - 当存在时间先后顺序时用"时序关系"
+       - 其他情况应创造性地概括关系本质，例如：
+         * "股权关系"（当涉及持股/控股时）
+         * "协议关系"（当涉及合同/协议时）
+         * "供应链关系"（当涉及上下游时）
+         * "人事关系"（当涉及高管关联时）
+
+
+
+    4. 返回json格式示例：
+    {
+        "edges": [
+            {
+                "from": "节点1ID",
+                "to": "节点2ID",
+                "type": "因果关系",
+                "value": "促使",
+                "context": "市场需求下降促使公司调整生产计划",
+            },
+            {
+                "from": "节点3ID",
+                "to": "节点4ID",
+                "type": "供应链关系", 
+                "value": "长期供货",
+                "context": "与XX公司签订三年期原材料供货协议",
             }
-        },
-        {
-            "from": "节点3ID",
-            "to": "节点4ID",
-            "type": "时序关系", 
-            "value": "之后",
-            "properties": {
-                "time_interval": "1个月"
-            }
-        }
-    ]
-}"""
+
+        5. context字段必须从原始文本中提取包含from和to节点的实际语句片段
+           - 最少30字，最多100字
+           - 必须直接体现from和to节点的关系
+           - 示例: 
+             "context": "公司公告显示，由于[from节点值](业绩下滑)，导致[to节点值](股价下跌)超过5%"
+
+        6. 如果找不到直接体现关系的文本，则:
+           - 从文本中提取最接近from和to节点的语句组合
+           - 添加说明: "根据公告内容推断"
+           - 示例:
+             "context": "根据公告内容推断: [from节点值](董事会决议)后，公司将进行[to节点值](股东大会审议)"
+            ]
+    }"""
 }
 
 
@@ -873,14 +886,14 @@ def save_edges_to_neo4j(edges: list, project_id: str):
         print(f"[Neo4j] 正在创建 {len(nodes)} 个节点...")
         print("node数据", nodes)
         for node in nodes:
-            node_type = "事件" if node['type'] == '1' else "实体"
+            node_type = "事件" if node['type'] == '事件' else "实体"
 
             query = """
                 MERGE (n:KnowledgeNode {id: $id})
                 SET n.type = $type,
                     n.value = $value,
                     n.key = $key,
-                    n.name = $key,  
+                    n.name = $value,  
                     n.project_id = $project_id,
                     n += $properties
             """
@@ -895,6 +908,7 @@ def save_edges_to_neo4j(edges: list, project_id: str):
 
         # 第四步：创建关系
         print(f"[Neo4j] 正在创建 {len(edges)} 条关系...")
+        print("边的数据：", edges)
         for edge in edges:
             from_node = nodes_map.get(edge['from'])
             to_node = nodes_map.get(edge['to'])
@@ -1273,7 +1287,7 @@ def get_edges_by_project():
         engine = get_sqlalchemy_engine()
         with engine.connect() as connection:
             query = text("""
-                SELECT id, type, `from`, `to`, eventRel, value, properties 
+                SELECT id, type, `from` as from_, `to`, eventRel, value, properties 
                 FROM edge_table 
                 WHERE project_id = :project_id
             """)
@@ -1329,3 +1343,40 @@ def get_edges_by_project():
         }), 500
     finally:
         engine.dispose()
+
+
+@llmGenKG_bp.route('/check_extraction_status', methods=['POST'])
+def check_extraction_status():
+    try:
+        # 从请求体中获取project_id
+        project_id = request.json.get('project_id')  # 修改点
+        print("检查阶段的project_id：", project_id)
+        if not project_id:
+            return jsonify({'success': False, 'message': '项目ID不能为空'}), 400
+
+        # 检查节点状态
+        engine = get_sqlalchemy_engine()
+        with engine.connect() as conn:
+            # 检查节点
+            node_query = text("SELECT COUNT(*) FROM node_table WHERE project_id = :project_id")
+            node_count = conn.execute(node_query, {"project_id": project_id}).scalar()
+
+            # 检查关系
+            edge_query = text("SELECT COUNT(*) FROM edge_table WHERE project_id = :project_id")
+            edge_count = conn.execute(edge_query, {"project_id": project_id}).scalar()
+
+            print("node_count:", node_count)
+            print("edge_count:", edge_count)
+
+        return jsonify({
+            'success': True,
+            'has_nodes': node_count > 0,
+            'has_edges': edge_count > 0,
+            "status": 200,
+        })
+
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'message': f'检查状态失败: {str(e)}'
+        }), 500
